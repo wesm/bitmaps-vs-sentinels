@@ -12,7 +12,7 @@
 #include "benchmark/benchmark.h"
 
 constexpr int64_t kArrayLength = 10000000;
-constexpr double kPercentNull = 0.1;
+constexpr double kPercentNull = 0.5;
 
 namespace BitUtil = arrow::BitUtil;
 using arrow::internal::BitmapReader;

@@ -245,7 +245,7 @@ struct SumBitmapVectorizeUnroll {
         state->valid_count += kBytePopcount[valid_byte];
       } else {
         // No nulls
-        state->total = values[0] + values[1] + values[2] + values[3]
+        state->total += values[0] + values[1] + values[2] + values[3]
           + values[4] + values[5] + values[6] + values[7];
         state->valid_count += 8;
       }
@@ -281,6 +281,12 @@ void BenchSentinels(benchmark::State& state) {
   Traits<T>::Generate(kArrayLength, &data);
   AddNullSentinels<T>(kPercentNull, &data);
 
+  {
+    SumState<T> sum_state;
+    Summer::Sum(data.data(), kArrayLength, &sum_state);
+    sum_state.Print();
+  }
+
   while (state.KeepRunning()) {
     SumState<T> sum_state;
     Summer::Sum(data.data(), kArrayLength, &sum_state);
@@ -299,6 +305,7 @@ void BenchBitmap(benchmark::State& state) {
   {
     SumState<T> sum_state;
     Summer::Sum(data.data(), bitmap.data(), kArrayLength, &sum_state);
+    sum_state.Print();
   }
 
   while (state.KeepRunning()) {

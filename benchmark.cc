@@ -12,7 +12,7 @@
 #include "benchmark/benchmark.h"
 
 constexpr int64_t kArrayLength = 10000000;
-constexpr double kPercentNull = 0.5;
+constexpr double kPercentNull = 0.0;
 
 namespace BitUtil = arrow::BitUtil;
 using arrow::internal::BitmapReader;
@@ -32,13 +32,67 @@ struct SumState {
 };
 
 template <typename T>
-void GenerateFloatingPoint(int64_t length, std::vector<T>* out) {
-  std::mt19937 gen(0);
-  std::uniform_real_distribution<T> d(-10, 10);
-  out->resize(length, static_cast<T>(0));
-  std::generate(out->begin(), out->end(),
-                [&d, &gen] { return static_cast<T>(d(gen)); });
+struct Traits {};
+
+template <typename T>
+void AddNullSentinels(double null_probability, std::vector<T>* out) {
+  const int random_seed = 0;
+  std::mt19937 gen(random_seed);
+  std::uniform_real_distribution<double> d(0.0, 1.0);
+
+  const T sentinel = Traits<T>::null_sentinel;
+
+  for (size_t i = 0; i < out->size(); ++i) {
+    if (d(gen) < null_probability) {
+      (*out)[i] = sentinel;
+    }
+  }
 }
+
+
+template <>
+struct Traits<double> {
+  static constexpr double null_sentinel = static_cast<double>(NAN);
+
+  static void Generate(int64_t length, std::vector<double>* out) {
+    std::mt19937 gen(0);
+    std::uniform_real_distribution<double> d(-10, 10);
+    out->resize(length, static_cast<double>(0));
+    std::generate(out->begin(), out->end(),
+                  [&d, &gen] { return static_cast<double>(d(gen)); });
+  }
+
+  static inline bool IsNull(double val) {
+    return val != val;
+  }
+
+  static inline bool NotNull(double val) {
+    return val == val;
+  }
+
+};
+
+template <>
+struct Traits<int64_t> {
+  static constexpr int64_t null_sentinel = std::numeric_limits<int64_t>::min();
+
+  static void Generate(int64_t length, std::vector<int64_t>* out) {
+    std::mt19937 gen(0);
+    std::uniform_int_distribution<int64_t> d(-10, 10);
+    out->resize(length, 0);
+    std::generate(out->begin(), out->end(),
+                  [&d, &gen] { return static_cast<int64_t>(d(gen)); });
+  }
+
+  static inline bool IsNull(int64_t val) {
+    return val == null_sentinel;
+  }
+
+  static inline bool NotNull(int64_t val) {
+    return val != null_sentinel;
+  }
+
+};
 
 void GenerateValidBitmap(int64_t length, double null_probability,
                          std::vector<uint8_t>* out) {
@@ -50,20 +104,6 @@ void GenerateValidBitmap(int64_t length, double null_probability,
     if (d(gen) > null_probability) {
       // Set the i-th bit to 1
       BitUtil::SetBit(out->data(), i);
-    }
-  }
-}
-
-
-template <typename T>
-void AddNullSentinels(T sentinel, double null_probability,
-                      std::vector<T>* out) {
-  const int random_seed = 0;
-  std::mt19937 gen(random_seed);
-  std::uniform_real_distribution<double> d(0.0, 1.0);
-  for (size_t i = 0; i < out->size(); ++i) {
-    if (d(gen) < null_probability) {
-      (*out)[i] = sentinel;
     }
   }
 }
@@ -97,10 +137,10 @@ struct SumNoNullsBatched {
 };
 
 template <typename T>
-struct SumWithNaN {
+struct SumSentinel {
   static void Sum(const T* values, int64_t length, SumState<T>* state) {
     for (int64_t i = 0; i < length; ++i) {
-      if (*values == *values) {
+      if (Traits<T>::NotNull(*values)) {
         // NaN is not equal to itself
         state->total += *values;
         ++state->valid_count;
@@ -111,13 +151,13 @@ struct SumWithNaN {
 };
 
 template <typename T>
-struct SumWithNaNVectorize {
+struct SumSentinelVectorize {
   static void Sum(const T* values, int64_t length, SumState<T>* state) {
     const int64_t batches = length / 8;
 
 #define SUM_NOT_NULL(ITEM)                      \
     do {                                        \
-      if (values[ITEM] == values[ITEM]) {       \
+      if (Traits<T>::NotNull(values[ITEM])) {    \
         state->total += values[ITEM];           \
         ++state->valid_count;                   \
       }                                         \
@@ -136,7 +176,7 @@ struct SumWithNaNVectorize {
     }
 
     for (int64_t i = batches * 8; i < length; ++i) {
-      if (*values == *values) {
+      if (Traits<T>::NotNull(*values)) {
         state->total += *values;
         ++state->valid_count;
       }
@@ -222,84 +262,125 @@ struct SumBitmapVectorizeUnroll {
   }
 };
 
-template <typename Summer>
+template <typename T, typename Summer>
 void BenchNoNulls(benchmark::State& state) {
-  std::vector<double> data;
-  GenerateFloatingPoint(kArrayLength, &data);
+  std::vector<T> data;
+  Traits<T>::Generate(kArrayLength, &data);
 
   while (state.KeepRunning()) {
-    SumState<double> sum_state;
+    SumState<T> sum_state;
     Summer::Sum(data.data(), kArrayLength, &sum_state);
     benchmark::DoNotOptimize(sum_state);
   }
 }
 
-template <typename Summer>
+template <typename T, typename Summer>
 void BenchSentinels(benchmark::State& state) {
-  std::vector<double> data;
+  std::vector<T> data;
 
-  GenerateFloatingPoint(kArrayLength, &data);
-  AddNullSentinels<double>(static_cast<double>(NAN), kPercentNull, &data);
+  Traits<T>::Generate(kArrayLength, &data);
+  AddNullSentinels<T>(kPercentNull, &data);
 
   while (state.KeepRunning()) {
-    SumState<double> sum_state;
+    SumState<T> sum_state;
     Summer::Sum(data.data(), kArrayLength, &sum_state);
     benchmark::DoNotOptimize(sum_state);
   }
 }
 
-template <typename Summer>
+template <typename T, typename Summer>
 void BenchBitmap(benchmark::State& state) {
-  std::vector<double> data;
+  std::vector<T> data;
   std::vector<uint8_t> bitmap;
 
-  GenerateFloatingPoint(kArrayLength, &data);
+  Traits<T>::Generate(kArrayLength, &data);
   GenerateValidBitmap(kArrayLength, kPercentNull, &bitmap);
 
   {
-    SumState<double> sum_state;
+    SumState<T> sum_state;
     Summer::Sum(data.data(), bitmap.data(), kArrayLength, &sum_state);
   }
 
   while (state.KeepRunning()) {
-    SumState<double> sum_state;
+    SumState<T> sum_state;
     Summer::Sum(data.data(), bitmap.data(), kArrayLength, &sum_state);
     benchmark::DoNotOptimize(sum_state);
   }
 }
 
 static void BM_SumDoubleNoNulls(benchmark::State& state) {
-  BenchNoNulls<SumNoNulls<double>>(state);
+  BenchNoNulls<double, SumNoNulls<double>>(state);
+}
+
+static void BM_SumInt64NoNulls(benchmark::State& state) {
+  BenchNoNulls<int64_t, SumNoNulls<int64_t>>(state);
 }
 
 static void BM_SumDoubleNoNullsBatched(benchmark::State& state) {
-  BenchNoNulls<SumNoNullsBatched<double>>(state);
+  BenchNoNulls<double, SumNoNullsBatched<double>>(state);
 }
 
-static void BM_SumDoubleWithNaN(benchmark::State& state) {
-  BenchSentinels<SumWithNaN<double>>(state);
+static void BM_SumInt64NoNullsBatched(benchmark::State& state) {
+  BenchNoNulls<int64_t, SumNoNullsBatched<int64_t>>(state);
 }
 
-static void BM_SumDoubleWithNaNVectorize(benchmark::State& state) {
-  BenchSentinels<SumWithNaNVectorize<double>>(state);
+static void BM_SumDoubleSentinel(benchmark::State& state) {
+  BenchSentinels<double, SumSentinel<double>>(state);
+}
+
+static void BM_SumInt64Sentinel(benchmark::State& state) {
+  BenchSentinels<int64_t, SumSentinel<int64_t>>(state);
+}
+
+static void BM_SumDoubleSentinelVectorize(benchmark::State& state) {
+  BenchSentinels<double, SumSentinelVectorize<double>>(state);
+}
+
+static void BM_SumInt64SentinelVectorize(benchmark::State& state) {
+  BenchSentinels<int64_t, SumSentinelVectorize<int64_t>>(state);
 }
 
 static void BM_SumDoubleBitmapReader(benchmark::State& state) {
-  BenchBitmap<SumBitmapReader<double>>(state);
+  BenchBitmap<double, SumBitmapReader<double>>(state);
+}
+
+static void BM_SumInt64BitmapReader(benchmark::State& state) {
+  BenchBitmap<int64_t, SumBitmapReader<int64_t>>(state);
 }
 
 static void BM_SumDoubleBitmapNaive(benchmark::State& state) {
-  BenchBitmap<SumBitmapNaive<double>>(state);
+  BenchBitmap<double, SumBitmapNaive<double>>(state);
+}
+
+static void BM_SumInt64BitmapNaive(benchmark::State& state) {
+  BenchBitmap<int64_t, SumBitmapNaive<int64_t>>(state);
 }
 
 static void BM_SumDoubleBitmapVectorize(benchmark::State& state) {
-  BenchBitmap<SumBitmapVectorizeUnroll<double>>(state);
+  BenchBitmap<double, SumBitmapVectorizeUnroll<double>>(state);
+}
+
+static void BM_SumInt64BitmapVectorize(benchmark::State& state) {
+  BenchBitmap<int64_t, SumBitmapVectorizeUnroll<int64_t>>(state);
 }
 
 BENCHMARK(BM_SumDoubleNoNulls)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64NoNulls)->Unit(benchmark::kMicrosecond);
+
 BENCHMARK(BM_SumDoubleNoNullsBatched)->Unit(benchmark::kMicrosecond);
-BENCHMARK(BM_SumDoubleWithNaN)->Unit(benchmark::kMicrosecond);
-BENCHMARK(BM_SumDoubleWithNaNVectorize)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64NoNullsBatched)->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_SumDoubleSentinel)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64Sentinel)->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_SumDoubleSentinelVectorize)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64SentinelVectorize)->Unit(benchmark::kMicrosecond);
+
 BENCHMARK(BM_SumDoubleBitmapNaive)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64BitmapNaive)->Unit(benchmark::kMicrosecond);
+
 BENCHMARK(BM_SumDoubleBitmapReader)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64BitmapReader)->Unit(benchmark::kMicrosecond);
+
 BENCHMARK(BM_SumDoubleBitmapVectorize)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SumInt64BitmapVectorize)->Unit(benchmark::kMicrosecond);
